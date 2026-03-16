@@ -7,3 +7,4 @@ argon2-cffi
 python-multipart
 email-validator
 httpx
+redis

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
-import shutil
+import hashlib
 from datetime import datetime
 from typing import Optional, List
 
@@ -18,12 +18,19 @@ from core.gpt_client import (
     parse_prescription_form_from_ocr,
 )
 from core.config import OCR_UPLOAD_DIR
+from core.redis_store import (
+    get_ocr_result,
+    get_parse_result,
+    set_ocr_job_status,
+    set_ocr_result,
+    set_parse_result,
+)
 
 
 # -----------------------------
 # 파일 저장
 # -----------------------------
-def save_file(upload: UploadFile) -> str:
+def save_file(upload: UploadFile) -> tuple[str, str]:
     os.makedirs(OCR_UPLOAD_DIR, exist_ok=True)
 
     ext = os.path.splitext(upload.filename or "")[1]
@@ -31,11 +38,17 @@ def save_file(upload: UploadFile) -> str:
     file_path = os.path.join(OCR_UPLOAD_DIR, new_name)
 
     upload.file.seek(0)
+    content = upload.file.read()
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    file_hash = hashlib.sha256(content).hexdigest()
     with open(file_path, "wb") as f:
-        shutil.copyfileobj(upload.file, f)
+        f.write(content)
+
+    upload.file.seek(0)
 
     print(f"[OCR] Saved upload to: {file_path}")
-    return file_path
+    return file_path, file_hash
 
 
 # -----------------------------
@@ -85,7 +98,7 @@ def run_ocr_and_save(
     source_type: str,
     visit_id: Optional[int] = None,
 ) -> OCRJob:
-    path = save_file(upload_file)
+    path, file_hash = save_file(upload_file)
 
     file_obj = create_file_record(db, user_id, upload_file, path)
 
@@ -100,13 +113,40 @@ def run_ocr_and_save(
     db.add(ocr)
     db.commit()
     db.refresh(ocr)
+    set_ocr_job_status(
+        ocr.ocr_id,
+        {
+            "ocr_id": ocr.ocr_id,
+            "file_id": ocr.file_id,
+            "user_id": ocr.user_id,
+            "source_type": ocr.source_type,
+            "status": ocr.status,
+            "text": ocr.text,
+            "visit_id": ocr.visit_id,
+            "created_at": ocr.created_at,
+            "completed_at": ocr.completed_at,
+        },
+    )
     print(
         f"[OCR] OCRJob created: ocr_id={ocr.ocr_id}, "
         f"source_type={source_type}, status={ocr.status}"
     )
 
     try:
-        text = run_ocr_model(path)
+        cached = get_ocr_result(source_type, file_hash)
+        if cached and cached.get("text") is not None:
+            text = cached.get("text", "")
+            print(f"[OCR] Redis cache hit: source_type={source_type}, hash={file_hash[:12]}")
+        else:
+            text = run_ocr_model(path)
+            set_ocr_result(
+                source_type,
+                file_hash,
+                {
+                    "status": "DONE",
+                    "text": text,
+                },
+            )
         ocr.text = text
         ocr.status = "DONE"
         print(f"[OCR] OCRJob {ocr.ocr_id} DONE, text_len={len(text)}")
@@ -119,6 +159,20 @@ def run_ocr_and_save(
     db.add(ocr)
     db.commit()
     db.refresh(ocr)
+    set_ocr_job_status(
+        ocr.ocr_id,
+        {
+            "ocr_id": ocr.ocr_id,
+            "file_id": ocr.file_id,
+            "user_id": ocr.user_id,
+            "source_type": ocr.source_type,
+            "status": ocr.status,
+            "text": ocr.text,
+            "visit_id": ocr.visit_id,
+            "created_at": ocr.created_at,
+            "completed_at": ocr.completed_at,
+        },
+    )
 
     print(
         f"[OCR] OCRJob final: ocr_id={ocr.ocr_id}, status={ocr.status}, "
@@ -139,6 +193,11 @@ def parse_ocr_text_to_visit(text: str) -> VisitFormSchema:
     print(f"[PARSE][VISIT] input text length: {len(text)}")
     print("[PARSE][VISIT] input head:")
     print(text[:500])
+
+    cached = get_parse_result("visit", text)
+    if cached:
+        print("[PARSE][VISIT] Redis cache hit")
+        return VisitFormSchema(**cached)
 
     try:
         raw = parse_visit_form_from_ocr(text) or {}
@@ -204,7 +263,9 @@ def parse_ocr_text_to_visit(text: str) -> VisitFormSchema:
         print("[PARSE][VISIT] mapped data:")
         print(data)
         print("[PARSE][VISIT] ===== SUCCESS =====\n")
-        return VisitFormSchema(**data)
+        parsed = VisitFormSchema(**data)
+        set_parse_result("visit", text, parsed.model_dump())
+        return parsed
 
     except Exception as e:
         print(f"[PARSE][VISIT][ERROR] parsing failed: {e}")
@@ -220,7 +281,9 @@ def parse_ocr_text_to_visit(text: str) -> VisitFormSchema:
         print("[PARSE][VISIT] returning dummy data:")
         print(dummy)
         print("[PARSE][VISIT] ===== FALLBACK =====\n")
-        return VisitFormSchema(**dummy)
+        parsed = VisitFormSchema(**dummy)
+        set_parse_result("visit", text, parsed.model_dump())
+        return parsed
 
 
 # ==================================================
@@ -236,6 +299,11 @@ def parse_ocr_text_to_prescription(text: str) -> List[PrescriptionFormSchema]:
     print(f"[PARSE][PRESC] input text length: {len(text)}")
     print("[PARSE][PRESC] input head:")
     print(text[:500])
+
+    cached = get_parse_result("prescription", text)
+    if cached:
+        print("[PARSE][PRESC] Redis cache hit")
+        return [PrescriptionFormSchema(**item) for item in cached.get("items", [])]
 
     try:
         raw = parse_prescription_form_from_ocr(text) or {}
@@ -343,10 +411,16 @@ def parse_ocr_text_to_prescription(text: str) -> List[PrescriptionFormSchema]:
             print("[PARSE][PRESC] no valid meds, returning single dummy")
             print(dummy)
             print("[PARSE][PRESC] ===== FALLBACK (EMPTY) =====\n")
+            set_parse_result("prescription", text, {"items": [dummy.model_dump()]})
             return [dummy]
 
         print(f"[PARSE][PRESC] total parsed meds: {len(parsed_list)}")
         print("[PARSE][PRESC] ===== SUCCESS =====\n")
+        set_parse_result(
+            "prescription",
+            text,
+            {"items": [item.model_dump() for item in parsed_list]},
+        )
         return parsed_list
 
     except Exception as e:
@@ -364,4 +438,5 @@ def parse_ocr_text_to_prescription(text: str) -> List[PrescriptionFormSchema]:
         print("[PARSE][PRESC] returning dummy list:")
         print(dummy)
         print("[PARSE][PRESC] ===== FALLBACK (EXCEPTION) =====\n")
+        set_parse_result("prescription", text, {"items": [dummy.model_dump()]})
         return [dummy]

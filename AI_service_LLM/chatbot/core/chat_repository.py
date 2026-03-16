@@ -5,11 +5,24 @@ from __future__ import annotations
 import os
 import json  # 🔥 JSON 직렬화를 위해 추가
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Literal, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+from .redis_store import (
+    append_recent_logs,
+    append_session_messages,
+    clear_all_llm_cache,
+    clear_session_cache,
+    clear_user_cache,
+    get_cached_recent_logs,
+    get_cached_session_messages,
+    set_recent_logs,
+    set_session_messages,
+)
 
 load_dotenv()
 
@@ -46,6 +59,22 @@ def _get_engine() -> Engine:
 
 
 engine: Engine = _get_engine()
+
+
+def _build_cached_message(
+    *,
+    user_id: int,
+    role: str,
+    content: str,
+    sources: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "role": role,
+        "content": content,
+        "created_at": datetime.utcnow().isoformat(),
+        "sources": sources,
+    }
 
 
 # =========================================================
@@ -154,6 +183,21 @@ def create_session_with_log(
 
         # TODO: used_model, latency_ms 는 별도 metric 테이블이 있으면 거기에 저장
 
+    cached_messages = [
+        _build_cached_message(user_id=user_id_int, role="user", content=query, sources=None),
+        _build_cached_message(user_id=user_id_int, role="assistant", content=answer, sources=sources),
+    ]
+    append_session_messages(
+        session_id=int(session_id),
+        user_id=user_id_int,
+        messages=cached_messages,
+    )
+    append_recent_logs(
+        user_id=user_id_int,
+        session_id=int(session_id),
+        messages=cached_messages,
+    )
+
     return int(session_id)
 
 
@@ -201,7 +245,6 @@ def append_log(
                 "sources": None,
             },
         )
-
         # assistant 메시지
         conn.execute(
             text(
@@ -218,6 +261,21 @@ def append_log(
                 "sources": assistant_sources_json,
             },
         )
+
+    cached_messages = [
+        _build_cached_message(user_id=user_id_int, role="user", content=query, sources=None),
+        _build_cached_message(user_id=user_id_int, role="assistant", content=answer, sources=sources),
+    ]
+    append_session_messages(
+        session_id=session_id_int,
+        user_id=user_id_int,
+        messages=cached_messages,
+    )
+    append_recent_logs(
+        user_id=user_id_int,
+        session_id=session_id_int,
+        messages=cached_messages,
+    )
 
 
 def upsert_session_with_log(
@@ -314,6 +372,15 @@ def get_session_messages(
     "role + content + created_at + sources" 형태로 반환.
     (메인 백엔드와 맞추기 위해 sources 도 포함)
     """
+    session_id_int = int(session_id)
+    user_id_int = _resolve_user_id(user_id)
+
+    cached_messages = get_cached_session_messages(session_id_int)
+    if cached_messages:
+        cached_user_id = cached_messages[0].get("user_id")
+        if cached_user_id is None or int(cached_user_id) == user_id_int:
+            return cached_messages
+
     base_sql = """
         SELECT role, content, created_at, user_id, sources
         FROM chat_log
@@ -322,9 +389,9 @@ def get_session_messages(
         ORDER BY created_at ASC, message_id ASC
     """
 
-    params: Dict[str, Any] = {"session_id": int(session_id)}
+    params: Dict[str, Any] = {"session_id": session_id_int}
     user_filter = "AND user_id = :user_id"
-    params["user_id"] = _resolve_user_id(user_id)
+    params["user_id"] = user_id_int
 
     sql = base_sql.format(user_filter=user_filter)
 
@@ -338,6 +405,7 @@ def get_session_messages(
     for row in rows:
         messages.append(
             {
+                "user_id": row["user_id"],
                 "role": row["role"],
                 "content": row["content"],
                 "created_at": row["created_at"],   # datetime
@@ -345,6 +413,11 @@ def get_session_messages(
             }
         )
 
+    set_session_messages(
+        session_id=session_id_int,
+        user_id=user_id_int,
+        messages=messages,
+    )
     return messages
 
 
@@ -387,6 +460,9 @@ def delete_session(session_id: int | str, user_id: Optional[int | str] = None) -
         )
         deleted = res.rowcount or 0
 
+    if deleted > 0:
+        clear_session_cache(session_id_int, target_user_id)
+
     return deleted > 0
 
 
@@ -405,6 +481,7 @@ def delete_all_sessions(
             conn.execute(
                 text("TRUNCATE chat_log, chat_session RESTART IDENTITY CASCADE")
             )
+            clear_all_llm_cache()
             return
 
         target_user_id = _resolve_user_id(user_id)
@@ -416,6 +493,8 @@ def delete_all_sessions(
             text("DELETE FROM chat_session WHERE user_id = :user_id"),
             {"user_id": target_user_id},
         )
+
+    clear_user_cache(target_user_id)
 
 
 # =========================================================
@@ -513,6 +592,7 @@ def delete_all_history() -> None:
     """
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE chat_log, chat_session RESTART IDENTITY CASCADE"))
+    clear_all_llm_cache()
 
 
 def delete_history_one(session_id: str | int) -> bool:
@@ -531,6 +611,9 @@ def delete_history_one(session_id: str | int) -> bool:
         )
         deleted = res.rowcount or 0
 
+    if deleted > 0:
+        clear_session_cache(session_id_int)
+
     return deleted > 0
 
 
@@ -544,6 +627,10 @@ def get_recent_logs(
      session_id, role, content, created_at 을 그대로 반환)
     """
     user_id_int = _resolve_user_id(user_id)
+
+    cached_logs = get_cached_recent_logs(user_id_int, limit)
+    if cached_logs:
+        return cached_logs
 
     sql = """
         SELECT
@@ -562,4 +649,7 @@ def get_recent_logs(
             text(sql), {"user_id": user_id_int, "limit": limit}
         ).mappings().all()
 
-    return [dict(row) for row in rows]
+    logs = [dict(row) for row in rows]
+    if logs:
+        set_recent_logs(user_id_int, logs)
+    return logs

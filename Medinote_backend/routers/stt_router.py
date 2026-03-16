@@ -18,6 +18,7 @@ from schemas.stt_schemas import (
     STTStatusResponse,
     STTResultInput,
 )
+from utils.redis_store import get_stt_status, set_stt_status
 
 router = APIRouter(prefix="/stt", tags=["STT"])
 
@@ -45,6 +46,14 @@ async def analyze_stt(
 
     # STTJob 생성
     stt_item = create_stt_job(db, user_id=user_id)
+    set_stt_status(
+        stt_item.stt_id,
+        {
+            "stt_id": stt_item.stt_id,
+            "user_id": user_id,
+            "status": stt_item.status,
+        },
+    )
 
     # STT 서버로 파일 전송
     try:
@@ -90,6 +99,35 @@ def get_status(
     """
 
     job = get_stt_job(db, stt_id)
+    cached = get_stt_status(stt_id)
+
+    if cached:
+        if job and cached.get("status") in {"done", "error"} and job.status != cached.get("status"):
+            updated = update_stt_result(
+                db,
+                stt_id,
+                {
+                    "status": cached.get("status"),
+                    "diagnosis": cached.get("diagnosis"),
+                    "symptoms": cached.get("symptoms"),
+                    "notes": cached.get("notes"),
+                    "date": cached.get("date"),
+                },
+            )
+            if updated:
+                job = updated
+
+        payload = {
+            "stt_id": stt_id,
+            "status": cached.get("status") or (job.status if job else "pending"),
+            "user_id": cached.get("user_id") or (job.user_id if job else None),
+            "diagnosis": cached.get("diagnosis") or (job.diagnosis if job else None),
+            "symptoms": cached.get("symptoms") or (job.symptoms if job else None),
+            "notes": cached.get("notes") or (job.notes if job else None),
+            "date": cached.get("date") or (job.date if job else None),
+        }
+        return STTStatusResponse(**payload)
+
     if not job:
         raise HTTPException(status_code=404, detail="STT job not found")
 
@@ -113,5 +151,18 @@ async def receive_stt_result(
     updated = update_stt_result(db, stt_id, result.dict())
     if not updated:
         raise HTTPException(status_code=404, detail="STT job not found")
+
+    set_stt_status(
+        stt_id,
+        {
+            "stt_id": stt_id,
+            "user_id": updated.user_id,
+            "status": updated.status,
+            "diagnosis": updated.diagnosis,
+            "symptoms": updated.symptoms,
+            "notes": updated.notes,
+            "date": updated.date,
+        },
+    )
 
     return {"message": "result saved", "stt_id": stt_id}

@@ -1,19 +1,32 @@
+# ======================
 # Python
+# ======================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Virtual Environments
 venv/
+.venv/
+
+# Environment variables
 .env
 
+# ======================
 # Node / React
+# ======================
 node_modules/
 dist/
 *.local
 
-# Docker volume
+# ======================
+# Docker / Volumes
+# ======================
 postgres_data/
 
+# ======================
 # OS
+# ======================
 .DS_Store
 Thumbs.db

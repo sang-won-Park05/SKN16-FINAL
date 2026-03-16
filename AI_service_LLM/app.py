@@ -36,6 +36,12 @@ from chatbot.core.user_repository import (
 )
 from chatbot.core.llm import call_llm
 from chatbot.core.prompts import HEALTH_ANALYSIS_PROMPT
+from chatbot.core.redis_store import (
+    get_cached_analysis,
+    get_cached_query_response,
+    set_cached_analysis,
+    set_cached_query_response,
+)
 
 load_dotenv()
 
@@ -235,42 +241,63 @@ async def post_chatbot_query(payload: ChatQueryRequest):
     if payload.session_id:
         state["session_id"] = str(payload.session_id)
 
-    # 2) 오케스트레이터 실행
-    try:
-        new_state = run_orchestrator(state)
-    except Exception as e:
-        print(f"[LLM ERROR] session_id={payload.session_id} error={e!r}")
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "현재 챗봇 엔진에 문제가 발생하여 답변을 생성할 수 없습니다. "
-                "잠시 후 다시 시도해 주세요."
-            ),
+    cached_response = get_cached_query_response(
+        user_id=user_id,
+        session_id=payload.session_id,
+        query=payload.query,
+    )
+
+    if cached_response:
+        answer_text = cached_response.get("answer") or ""
+        sources_raw = cached_response.get("sources") or []
+        sources: List[ChatSource] = [
+            ChatSource(**s) for s in sources_raw
+            if isinstance(s, dict)
+        ]
+    else:
+        # 2) 오케스트레이터 실행
+        try:
+            new_state = run_orchestrator(state)
+        except Exception as e:
+            print(f"[LLM ERROR] session_id={payload.session_id} error={e!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "현재 챗봇 엔진에 문제가 발생하여 답변을 생성할 수 없습니다. "
+                    "잠시 후 다시 시도해 주세요."
+                ),
+            )
+
+        # 3) answer / sources 추출
+        answer_text = new_state.get("answer") or ""
+
+        # safety: answer 가 비어 있으면 마지막 assistant 메시지에서 fallback
+        if not answer_text:
+            msgs = new_state.get("messages") or []
+            if msgs and msgs[-1].get("role") == "assistant":
+                answer_text = msgs[-1].get("content", "")
+
+        if not answer_text:
+            answer_text = (
+                "죄송합니다. 현재는 적절한 답변을 생성하지 못했습니다. "
+                "질문을 조금 더 구체적으로 말씀해 주시면 도움이 됩니다."
+            )
+
+        sources_raw = new_state.get("sources") or []
+        sources = [
+            ChatSource(**s) for s in sources_raw
+            if isinstance(s, dict)
+        ] if sources_raw else []
+        set_cached_query_response(
+            user_id=user_id,
+            session_id=payload.session_id,
+            query=payload.query,
+            answer=answer_text,
+            sources=[s.model_dump() for s in sources] if sources else None,
         )
-
-    # 3) answer / sources 추출
-    answer_text: str = new_state.get("answer") or ""
-
-    # safety: answer 가 비어 있으면 마지막 assistant 메시지에서 fallback
-    if not answer_text:
-        msgs = new_state.get("messages") or []
-        if msgs and msgs[-1].get("role") == "assistant":
-            answer_text = msgs[-1].get("content", "")
-
-    if not answer_text:
-        answer_text = (
-            "죄송합니다. 현재는 적절한 답변을 생성하지 못했습니다. "
-            "질문을 조금 더 구체적으로 말씀해 주시면 도움이 됩니다."
-        )
-
-    sources_raw = new_state.get("sources") or []
-    sources: List[ChatSource] = [
-        ChatSource(**s) for s in sources_raw
-        if isinstance(s, dict)
-    ] if sources_raw else []
 
     # DB에 저장할 수 있도록 순수 dict 리스트로 변환
-    sources_for_db = [s.dict() for s in sources] if sources else None
+    sources_for_db = [s.model_dump() for s in sources] if sources else None
 
     # 4) DB 에 세션 + 로그 저장
     used_session_id = upsert_session_with_log(
@@ -473,6 +500,10 @@ async def post_health_analysis():
     medical_context = "\n\n".join(context_blocks) if context_blocks else "등록된 건강 정보가 없습니다."
 
     # 3) LLM 호출
+    cached_analysis = get_cached_analysis(user_id=user_id, context=medical_context)
+    if cached_analysis:
+        return HealthAnalysisResponse(analysis=cached_analysis)
+
     try:
         analysis = call_llm(
             system_prompt=HEALTH_ANALYSIS_PROMPT,
@@ -488,6 +519,8 @@ async def post_health_analysis():
 
     if not analysis:
         analysis = "건강 정보가 부족하여 분석을 수행할 수 없습니다."
+
+    set_cached_analysis(user_id=user_id, context=medical_context, analysis=analysis)
 
     # 4) 응답 반환 (chat_log 저장 X)
     return HealthAnalysisResponse(analysis=analysis)

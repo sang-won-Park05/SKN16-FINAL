@@ -18,6 +18,10 @@ from ..core.chat_repository import (
     delete_all_sessions,
     delete_session,
 )
+from ..core.redis_store import (
+    get_cached_query_response,
+    set_cached_query_response,
+)
 
 router = APIRouter(
     prefix="/chatbot",
@@ -158,32 +162,53 @@ async def chatbot_query(payload: ChatQueryRequest) -> ChatQueryResponse:
         if payload.session_id:
             state["session_id"] = str(payload.session_id)
 
-        # ------------------------------
-        # 2) LangGraph 실행
-        # ------------------------------
-        result: ChatState = chatbot_graph.invoke(state)
-
-        # ------------------------------
-        # 3) answer / sources 추출
-        # ------------------------------
-        answer_text: str = result.get("answer") or ""
-
-        # safety: answer 비어있으면 마지막 assistant 메시지에서 fallback
-        if not answer_text:
-            messages = result.get("messages") or []
-            if messages and messages[-1].get("role") == "assistant":
-                answer_text = messages[-1].get("content", "")
-
-        if not answer_text:
-            answer_text = (
-                "죄송합니다. 현재는 적절한 답변을 생성하지 못했습니다. "
-                "질문을 조금 더 구체적으로 말씀해 주시면 도움이 됩니다."
-            )
-
-        sources_raw = result.get("sources") or []
-        sources: List[ChatSource] = (
-            [ChatSource(**s) for s in sources_raw] if sources_raw else []
+        cached_response = get_cached_query_response(
+            user_id=user_id,
+            session_id=payload.session_id,
+            query=payload.query,
         )
+        if cached_response:
+            answer_text = cached_response.get("answer") or ""
+            sources_raw = cached_response.get("sources") or []
+            sources: List[ChatSource] = (
+                [ChatSource(**s) for s in sources_raw if isinstance(s, dict)]
+                if sources_raw else []
+            )
+        else:
+            # ------------------------------
+            # 2) LangGraph 실행
+            # ------------------------------
+            result: ChatState = chatbot_graph.invoke(state)
+
+            # ------------------------------
+            # 3) answer / sources 추출
+            # ------------------------------
+            answer_text = result.get("answer") or ""
+
+            # safety: answer 비어있으면 마지막 assistant 메시지에서 fallback
+            if not answer_text:
+                messages = result.get("messages") or []
+                if messages and messages[-1].get("role") == "assistant":
+                    answer_text = messages[-1].get("content", "")
+
+            if not answer_text:
+                answer_text = (
+                    "죄송합니다. 현재는 적절한 답변을 생성하지 못했습니다. "
+                    "질문을 조금 더 구체적으로 말씀해 주시면 도움이 됩니다."
+                )
+
+            sources_raw = result.get("sources") or []
+            sources = (
+                [ChatSource(**s) for s in sources_raw if isinstance(s, dict)]
+                if sources_raw else []
+            )
+            set_cached_query_response(
+                user_id=user_id,
+                session_id=payload.session_id,
+                query=payload.query,
+                answer=answer_text,
+                sources=[s.model_dump() for s in sources] if sources else None,
+            )
 
         # ------------------------------
         # 4) DB 저장 (세션 upsert + 로그 저장)
@@ -194,7 +219,7 @@ async def chatbot_query(payload: ChatQueryRequest) -> ChatQueryResponse:
             user_id=user_id,
             query=payload.query,
             answer=answer_text,
-            sources=[s.dict() for s in sources] if sources else None,
+            sources=[s.model_dump() for s in sources] if sources else None,
         )
 
         # ------------------------------

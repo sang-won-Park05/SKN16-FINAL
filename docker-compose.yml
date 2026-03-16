@@ -1,6 +1,17 @@
 version: "3.9"
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: medinote_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+      start_period: 5s
+
   db:
     image: postgres:16-alpine
     container_name: medinote_db
@@ -26,8 +37,11 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       FRONTEND_URL: ${FRONTEND_URL}
       STT_SERVER_URL: ${STT_SERVER_URL}
+      REDIS_URL: ${REDIS_URL}
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "8000:8000"
@@ -41,8 +55,11 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       BACKEND_URL: ${BACKEND_URL}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/medinote
+      REDIS_URL: ${REDIS_URL}
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "8002:8002"
@@ -57,8 +74,11 @@ services:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/medinote
       FRONTEND_URL: ${FRONTEND_URL}
       BACKEND_URL: http://backend:8000
+      REDIS_URL: ${REDIS_URL}
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       - /home/ubuntu/ocr_uploads:/app/uploads/ocr
@@ -90,8 +110,14 @@ services:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/medinote
       BACKEND_URL: http://backend:8000
       FRONTEND_URL: ${FRONTEND_URL}
+      REDIS_URL: ${REDIS_URL}
     volumes:
       - /home/ubuntu/chroma_db:/app/chroma_db
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "8001:8001"
     restart: unless-stopped

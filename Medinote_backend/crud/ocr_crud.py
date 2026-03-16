@@ -2,7 +2,7 @@
 
 import os
 import uuid
-import shutil
+import hashlib
 from datetime import datetime
 from typing import Optional
 
@@ -11,6 +11,13 @@ from sqlalchemy.orm import Session
 
 from models import File, OCRJob
 from schemas.ocr_schemas import VisitFormSchema
+from utils.redis_store import (
+    get_ocr_parse,
+    get_ocr_result,
+    set_ocr_job_status,
+    set_ocr_parse,
+    set_ocr_result,
+)
 
 UPLOAD_DIR = "uploads/ocr"
 
@@ -18,7 +25,7 @@ UPLOAD_DIR = "uploads/ocr"
 # -----------------------------
 # 파일 저장
 # -----------------------------
-def save_file(upload: UploadFile) -> str:
+def save_file(upload: UploadFile) -> tuple[str, str]:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
     ext = os.path.splitext(upload.filename or "")[1]
@@ -26,10 +33,17 @@ def save_file(upload: UploadFile) -> str:
     file_path = os.path.join(UPLOAD_DIR, new_name)
 
     upload.file.seek(0)
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(upload.file, f)
+    content = upload.file.read()
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    file_hash = hashlib.sha256(content).hexdigest()
 
-    return file_path
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    upload.file.seek(0)
+
+    return file_path, file_hash
 
 
 # -----------------------------
@@ -75,7 +89,7 @@ def run_ocr_and_save(
     visit_id: Optional[int] = None,   # visit_id는 Nullable
 ):
     # 1) 파일 저장
-    path = save_file(upload_file)
+    path, file_hash = save_file(upload_file)
 
     # 2) File 레코드 생성
     file_obj = create_file_record(db, user_id, upload_file, path)
@@ -92,10 +106,36 @@ def run_ocr_and_save(
     db.add(ocr)
     db.commit()
     db.refresh(ocr)
+    set_ocr_job_status(
+        ocr.ocr_id,
+        {
+            "ocr_id": ocr.ocr_id,
+            "file_id": ocr.file_id,
+            "user_id": ocr.user_id,
+            "source_type": ocr.source_type,
+            "status": ocr.status,
+            "text": ocr.text,
+            "visit_id": ocr.visit_id,
+            "created_at": ocr.created_at,
+            "completed_at": ocr.completed_at,
+        },
+    )
 
     # 4) OCR 모델 실행
     try:
-        text = run_ocr_model(path)
+        cached = get_ocr_result(source_type, file_hash)
+        if cached and cached.get("text") is not None:
+            text = cached.get("text", "")
+        else:
+            text = run_ocr_model(path)
+            set_ocr_result(
+                source_type,
+                file_hash,
+                {
+                    "status": "DONE",
+                    "text": text,
+                },
+            )
         ocr.text = text
         ocr.status = "DONE"
     except Exception as e:
@@ -107,6 +147,20 @@ def run_ocr_and_save(
     db.add(ocr)
     db.commit()
     db.refresh(ocr)
+    set_ocr_job_status(
+        ocr.ocr_id,
+        {
+            "ocr_id": ocr.ocr_id,
+            "file_id": ocr.file_id,
+            "user_id": ocr.user_id,
+            "source_type": ocr.source_type,
+            "status": ocr.status,
+            "text": ocr.text,
+            "visit_id": ocr.visit_id,
+            "created_at": ocr.created_at,
+            "completed_at": ocr.completed_at,
+        },
+    )
 
     return ocr
 
@@ -122,6 +176,10 @@ def parse_ocr_text_to_visit(text: str) -> VisitFormSchema:
     LLM 연동 시 여기를 교체하면 됨.
     """
 
+    cached = get_ocr_parse("visit", text)
+    if cached:
+        return VisitFormSchema(**cached)
+
     dummy = {
         "hospital": "",
         "doctor_name": "",
@@ -132,4 +190,6 @@ def parse_ocr_text_to_visit(text: str) -> VisitFormSchema:
         "date": str(datetime.today().date())
     }
 
-    return VisitFormSchema(**dummy)
+    parsed = VisitFormSchema(**dummy)
+    set_ocr_parse("visit", text, parsed.dict())
+    return parsed

@@ -12,6 +12,7 @@ cohere          # 🔹 이 줄 추가
 # DB
 sqlalchemy
 psycopg2-binary
+redis
 
 # 기타 유틸
 python-dotenv

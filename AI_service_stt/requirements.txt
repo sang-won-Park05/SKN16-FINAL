@@ -18,3 +18,4 @@ python-dotenv>=1.0.0
 # DB (crud.py에서 사용)
 sqlalchemy
 psycopg2-binary
+redis

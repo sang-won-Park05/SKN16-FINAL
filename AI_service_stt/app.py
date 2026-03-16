@@ -4,7 +4,7 @@ STT API Server (port 8002)
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.router import router
+from api.router import router, start_stt_worker, stop_stt_worker
 from core.crud import init_db
 from dotenv import load_dotenv
 
@@ -34,7 +34,13 @@ app.include_router(router)
 async def startup_event():
     """서버 시작 시 DB 초기화"""
     init_db()
+    start_stt_worker()
     print("✅ STT API Server started on port 8002")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    stop_stt_worker()
 
 
 @app.get("/")
