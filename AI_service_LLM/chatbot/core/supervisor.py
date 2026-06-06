@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import List, Literal
 
 from .state import ChatState
 from .tracing import traceable
-from .llm import call_llm
+from .llm import call_llm, get_embedding
 from .prompts import FINAL_GENERATOR_PROMPT
 
 # 각 에이전트 import
@@ -28,8 +29,34 @@ RouteName = Literal["chit", "db", "disease", "drug", "web", "history"]
 
 
 # =========================================================
-# 1) 규칙 기반 1차 라우터: route_supervisor
+# 1) 임베딩 기반 1차 라우터: route_supervisor
 # =========================================================
+
+ROUTE_DESCRIPTIONS: dict[RouteName, str] = {
+    "history": "이전 대화 과거 기록 방금 전 했던 말 요약 질문 답변 지난 기록 예전에 뭐라고 물어봤었지",
+    "db": "개인 진료 기록 내 처방전 검사 결과 입원 기록 나의 의료 건강 상태 프로필 몸무게 키 혈액형 알러지 병원 다녀온 의무기록 BMI 체질량",
+    "drug": "약 복용법 영양제 비타민 건강기능식품 부작용 상호작용 알약 처방약 병용 금기",
+    "disease": "증상 아픈 통증 두통 복통 열 발열 구토 설사 호흡곤란 진료과 어느 과 검사 질병 병명",
+    "web": "최신 뉴스 최근 연구 새로 나온 신약 리콜 가이드라인 업데이트 2024 2025 2026",
+}
+
+_ROUTE_EMBEDDINGS: dict[RouteName, List[float]] = {}
+
+
+def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
+    dot_product = sum(a * b for a, b in zip(v1, v2))
+    norm_v1 = math.sqrt(sum(a * a for a in v1))
+    norm_v2 = math.sqrt(sum(b * b for b in v2))
+    if norm_v1 == 0 or norm_v2 == 0:
+        return 0.0
+    return dot_product / (norm_v1 * norm_v2)
+
+
+def _init_route_embeddings() -> None:
+    if not _ROUTE_EMBEDDINGS:
+        for route, desc in ROUTE_DESCRIPTIONS.items():
+            _ROUTE_EMBEDDINGS[route] = get_embedding(desc)
+
 
 def _get_last_user_message(state: ChatState) -> str:
     messages = state.get("messages") or []
@@ -40,78 +67,41 @@ def _get_last_user_message(state: ChatState) -> str:
 
 def route_supervisor(state: ChatState) -> RouteName:
     """
-    유저 질문을 보고 적절한 에이전트로 라우팅하는 규칙 기반 1차 Supervisor.
+    유저 질문을 보고 text-embedding-3-large 임베딩 유사도를 사용해
+    가장 적절한 에이전트로 라우팅하는 1차 Supervisor.
     """
-
     text = _get_last_user_message(state)
     if not text:
         return "chit"
 
-    t = text.strip()
+    text = text.strip()
+    if not text:
+        return "chit"
 
-    # 1) 과거 대화 관련 (history agent)
-    history_keywords = [
-        "지난번", "예전에", "이전 대화", "지난 대화",
-        "전에 했던", "예전에 뭐라고", "지난 기록",
-        "예전에 뭐라고 했었지", "물어봤었지",
-        "이전 질문", "이전 답변",
-    ]
-    if any(k in t for k in history_keywords):
-        return "history"
+    # 임베딩 초기화 (Lazy load) 및 사용자 질문 임베딩
+    try:
+        _init_route_embeddings()
+        user_emb = get_embedding(text)
+    except Exception as e:
+        print(f"[SUPERVISOR] Embedding failed: {e}")
+        return "chit"
 
-    # 2) 개인 의료 DB
-    db_keywords = [
-        "진료 기록", "진료기록", "진료 내역", "진료내역",
-        "처방전", "내 처방", "지난 처방",
-        "검사 결과", "검사결과",
-        "입원 기록", "입원기록",
-        "나의 기록", "내 기록", "나의 진료", "개인 기록",
-        "병원 다녀온", "의무기록",
-        "건강 분석", "건강분석", "건강 상태", "건강상태",
-        "내 건강", "나의 건강", "건강 정보", "건강정보",
-        "프로필", "내 프로필", "건강 프로필",
-        "BMI", "체질량", "키", "몸무게", "음주", "흡연", "약 정보", "질환 정보", "알러지"
-    ]
-    if any(k in t for k in db_keywords):
-        return "db"
+    best_route: RouteName = "chit"
+    best_score = -1.0
 
-    # 3) 약/영양제/상호작용
-    drug_keywords = [
-        "약", "약을", "약이", "약은", "정(", "캡슐", "시럽",
-        "복용", "복용법", "복용해도", "먹어도", "먹으면",
-        "영양제", "비타민", "건강기능식품", "건기식",
-        "상호작용", "같이 먹어도", "병용", "같이 먹으면",
-        "충돌", "부작용", "반응이", "알약",
-        "약국", "처방약", "의약품",
-    ]
-    if any(k in t for k in drug_keywords):
-        return "drug"
+    for route, emb in _ROUTE_EMBEDDINGS.items():
+        score = _cosine_similarity(user_emb, emb)
+        if score > best_score:
+            best_score = score
+            best_route = route
 
-    # 4) 질병/증상/진료과
-    disease_keywords = [
-        "증상", "아픈", "아파요", "통증", "두통", "복통",
-        "메스꺼움", "구토", "설사", "변비",
-        "열이", "발열", "발진", "기침", "가래",
-        "호흡곤란", "숨쉬기", "호흡",
-        "진료과", "어느 과", "어떤 과",
-        "검사해야", "검사를 받아야",
-        "질병", "병명", "병인가요",
-    ]
-    if any(k in t for k in disease_keywords):
-        return "disease"
+    print(f"[SUPERVISOR] Embedding routing best score: {best_score:.3f} for {best_route}")
 
-    # 5) 최신 뉴스 / 새로운 정보 / 특정 연도
-    web_keywords = [
-        "최신", "최근", "요즘", "업데이트",
-        "새로 나온", "신약", "리콜", "뉴스",
-        "2023", "2024", "2025", "2026", "2027",
-        "최근 연구", "최근 발표",
-    ]
-    if any(k in t for k in web_keywords):
-        return "web"
+    # text-embedding-3-large 모델 특성상 적절한 임계값을 적용
+    if best_score < 0.25:
+        return "chit"
 
-    # 6) 그 외
-    return "chit"
+    return best_route
 
 
 # =========================================================

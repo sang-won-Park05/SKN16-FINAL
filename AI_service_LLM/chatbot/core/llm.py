@@ -88,3 +88,17 @@ def run_llm(
         model=model,
         temperature=temperature,
     )
+
+
+# ============================================
+# 🔹 Embedding 생성 함수
+# ============================================
+
+def get_embedding(text: str, model: str = "text-embedding-3-large") -> List[float]:
+    """
+    OpenAI 임베딩 모델을 사용하여 텍스트의 임베딩 벡터를 반환합니다.
+    """
+    client = get_client()
+    resp = client.embeddings.create(input=[text], model=model)
+    return resp.data[0].embedding
+
