@@ -36,3 +36,9 @@ class ChatState(TypedDict, total=False):
     # 이번 턴에서 사용된 출처 리스트
     # 예: [{"id": "...", "collection": "disease", "title": "...", "url": "...", "score": 0.87}, ...]
     sources: List[Dict[str, Any]]
+
+    # ===== 에이전트 수집 정보 =====
+    # 각 에이전트가 수집한 정보(Context)를 리스트로 축적.
+    # Final Generator가 이 정보를 종합하여 최종 답변을 생성한다.
+    # 예: [{"agent": "drug_agent", "context": "...", "sources": [...], "meta": {...}}, ...]
+    context_list: List[Dict[str, Any]]

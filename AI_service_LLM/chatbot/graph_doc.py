@@ -37,6 +37,9 @@ builder.add_node("chit_agent", _passthrough)
 # 3) RAG 관련 컴포넌트
 builder.add_node("retriever_reranker", _passthrough)
 
+# 4) 최종 답변 생성기 (Final Generator)
+builder.add_node("final_generator", _passthrough)
+
 # -------------------------------
 # 엔트리 포인트
 # -------------------------------
@@ -58,14 +61,19 @@ builder.add_edge("supervisor_planner", "chit_agent")
 builder.add_edge("disease_agent", "retriever_reranker")
 builder.add_edge("drug_agent", "retriever_reranker")
 
-# RAG 결과로 답변 생성 후 종료
-builder.add_edge("retriever_reranker", END)
+# RAG 결과 및 정보 수집 완료 후 최종 답변 생성기로
+builder.add_edge("retriever_reranker", "final_generator")
+builder.add_edge("web_agent", "final_generator")
+builder.add_edge("history_agent", "final_generator")
+builder.add_edge("db_agent", "final_generator")
 
-# 나머지 에이전트들도 END 로
-builder.add_edge("web_agent", END)
-builder.add_edge("history_agent", END)
-builder.add_edge("db_agent", END)
-builder.add_edge("chit_agent", END)
+# chit_agent는 단독일 땐 END로 가지만, 문서상으로는 최종 생성기로 병합되는 흐름으로 표현
+builder.add_edge("chit_agent", "final_generator")
+
+# -------------------------------
+# 4) 최종 답변 후 종료
+# -------------------------------
+builder.add_edge("final_generator", END)
 
 # -------------------------------
 # 최종 문서용 그래프

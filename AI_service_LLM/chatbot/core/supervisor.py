@@ -8,6 +8,7 @@ from typing import List, Literal
 from .state import ChatState
 from .tracing import traceable
 from .llm import call_llm
+from .prompts import FINAL_GENERATOR_PROMPT
 
 # 각 에이전트 import
 from ..agents import (
@@ -27,7 +28,7 @@ RouteName = Literal["chit", "db", "disease", "drug", "web", "history"]
 
 
 # =========================================================
-# 1) (기존) 규칙 기반 1차 라우터: route_supervisor
+# 1) 규칙 기반 1차 라우터: route_supervisor
 # =========================================================
 
 def _get_last_user_message(state: ChatState) -> str:
@@ -40,12 +41,6 @@ def _get_last_user_message(state: ChatState) -> str:
 def route_supervisor(state: ChatState) -> RouteName:
     """
     유저 질문을 보고 적절한 에이전트로 라우팅하는 규칙 기반 1차 Supervisor.
-    - history: 이전 대화/요약/지난 질문 관련
-    - db: 개인 의료 기록 (처방전, 진료기록, 복용약, 검사 결과)
-    - drug: 약/복용/영양제/상호작용 관련
-    - disease: 증상/질병/진료과/검사 관련
-    - web: 최신 정보/뉴스/년도 언급
-    - chit: 위에 해당하지 않는 일반 대화
     """
 
     text = _get_last_user_message(state)
@@ -54,9 +49,7 @@ def route_supervisor(state: ChatState) -> RouteName:
 
     t = text.strip()
 
-    # ---------------------------------------------------
     # 1) 과거 대화 관련 (history agent)
-    # ---------------------------------------------------
     history_keywords = [
         "지난번", "예전에", "이전 대화", "지난 대화",
         "전에 했던", "예전에 뭐라고", "지난 기록",
@@ -66,9 +59,7 @@ def route_supervisor(state: ChatState) -> RouteName:
     if any(k in t for k in history_keywords):
         return "history"
 
-    # ---------------------------------------------------
-    # 2) 개인 의료 DB (의무기록, 처방전, 진단서 등)
-    # ---------------------------------------------------
+    # 2) 개인 의료 DB
     db_keywords = [
         "진료 기록", "진료기록", "진료 내역", "진료내역",
         "처방전", "내 처방", "지난 처방",
@@ -84,9 +75,7 @@ def route_supervisor(state: ChatState) -> RouteName:
     if any(k in t for k in db_keywords):
         return "db"
 
-    # ---------------------------------------------------
-    # 3) 약/영양제/상호작용 → drug_agent
-    # ---------------------------------------------------
+    # 3) 약/영양제/상호작용
     drug_keywords = [
         "약", "약을", "약이", "약은", "정(", "캡슐", "시럽",
         "복용", "복용법", "복용해도", "먹어도", "먹으면",
@@ -98,9 +87,7 @@ def route_supervisor(state: ChatState) -> RouteName:
     if any(k in t for k in drug_keywords):
         return "drug"
 
-    # ---------------------------------------------------
-    # 4) 질병/증상/진료과 → disease_agent
-    # ---------------------------------------------------
+    # 4) 질병/증상/진료과
     disease_keywords = [
         "증상", "아픈", "아파요", "통증", "두통", "복통",
         "메스꺼움", "구토", "설사", "변비",
@@ -113,9 +100,7 @@ def route_supervisor(state: ChatState) -> RouteName:
     if any(k in t for k in disease_keywords):
         return "disease"
 
-    # ---------------------------------------------------
-    # 5) 최신 뉴스 / 새로운 정보 / 특정 연도 → web agent
-    # ---------------------------------------------------
+    # 5) 최신 뉴스 / 새로운 정보 / 특정 연도
     web_keywords = [
         "최신", "최근", "요즘", "업데이트",
         "새로 나온", "신약", "리콜", "뉴스",
@@ -125,9 +110,7 @@ def route_supervisor(state: ChatState) -> RouteName:
     if any(k in t for k in web_keywords):
         return "web"
 
-    # ---------------------------------------------------
-    # 6) 그 외 → 일반 대화
-    # ---------------------------------------------------
+    # 6) 그 외
     return "chit"
 
 
@@ -173,12 +156,6 @@ SUPERVISOR_PLANNER_SYSTEM_PROMPT = """
 
 
 def _plan_routes_with_llm(user_message: str, primary_route: RouteName) -> List[RouteName]:
-    """
-    GPT를 한 번 더 호출해서,
-    어떤 에이전트들을 어떤 순서로 실행할지 계획한다.
-
-    실패하거나 JSON 파싱이 안 되면, primary_route 하나만 사용.
-    """
     if not user_message:
         return [primary_route]
 
@@ -194,7 +171,7 @@ def _plan_routes_with_llm(user_message: str, primary_route: RouteName) -> List[R
             system_prompt=SUPERVISOR_PLANNER_SYSTEM_PROMPT,
             user_message=planner_user_message,
             context=None,
-            temperature=0.0,  # 플래너는 결정적이어야 함
+            temperature=0.0,
         )
     except Exception as e:
         print(f"[SUPERVISOR] planner LLM 호출 실패: {e!r}")
@@ -203,7 +180,6 @@ def _plan_routes_with_llm(user_message: str, primary_route: RouteName) -> List[R
     if not raw:
         return [primary_route]
 
-    # JSON 파싱
     try:
         data = json.loads(raw)
         routes_raw = data.get("routes", [])
@@ -214,7 +190,7 @@ def _plan_routes_with_llm(user_message: str, primary_route: RouteName) -> List[R
         cleaned: List[RouteName] = []
         for r in routes_raw:
             if isinstance(r, str) and r in allowed and r not in cleaned:
-                cleaned.append(r)  # 중복 제거
+                cleaned.append(r)
 
         if not cleaned:
             return [primary_route]
@@ -230,10 +206,6 @@ def _plan_routes_with_llm(user_message: str, primary_route: RouteName) -> List[R
 # =========================================================
 
 def _run_agent(route: RouteName, state: ChatState) -> ChatState:
-    """
-    주어진 route 이름에 따라 해당 에이전트를 실행.
-    각 에이전트는 state를 수정하고 반환한다.
-    """
     if route == "chit":
         return chit_agent.run(state)
     if route == "db":
@@ -247,28 +219,84 @@ def _run_agent(route: RouteName, state: ChatState) -> ChatState:
     if route == "history":
         return history_agent.run(state)
 
-    # 안전장치: 알 수 없는 route → 그냥 chit_agent
     return chit_agent.run(state)
 
 
 # =========================================================
-# 4) 오케스트레이터(=슈퍼바이저) 엔트리 포인트
+# 4) Final Generator (최종 답변 종합기)
+# =========================================================
+
+def _generate_final_answer(state: ChatState) -> ChatState:
+    user_message = _get_last_user_message(state)
+    context_list = state.get("context_list", [])
+
+    if not context_list:
+        answer = "죄송합니다. 관련 정보를 수집하지 못했습니다."
+        state["answer"] = answer
+        state["sources"] = []
+        state["messages"].append({
+            "role": "assistant",
+            "content": answer,
+            "meta": {"agent": "supervisor_final"},
+        })
+        return state
+
+    combined_context_parts = []
+    all_sources = []
+    seen_source_urls = set()
+
+    for item in context_list:
+        agent_name = item.get("agent", "unknown")
+        ctx = item.get("context", "")
+        srcs = item.get("sources", [])
+        
+        if ctx:
+            combined_context_parts.append(f"[{agent_name} 수집 정보]\n{ctx}")
+        
+        for src in srcs:
+            url = src.get("url")
+            if url:
+                if url not in seen_source_urls:
+                    seen_source_urls.add(url)
+                    all_sources.append(src)
+            else:
+                all_sources.append(src)
+
+    combined_context = "\n\n---\n\n".join(combined_context_parts)
+
+    answer = call_llm(
+        system_prompt=FINAL_GENERATOR_PROMPT,
+        user_message=user_message,
+        context=combined_context,
+    )
+
+    state["answer"] = answer
+    state["sources"] = all_sources
+    
+    state["messages"].append({
+        "role": "assistant",
+        "content": answer,
+        "meta": {
+            "agent": "supervisor_final",
+            "agents_used": [item.get("agent") for item in context_list]
+        },
+    })
+    
+    return state
+
+
+# =========================================================
+# 5) 오케스트레이터 엔트리 포인트
 # =========================================================
 
 @traceable(name="orchestrator")
 def run_orchestrator(state: ChatState) -> ChatState:
     """
-    하나의 유저 질문에 대해:
-
-    1) route_supervisor 로 1차 route 후보(primary)를 정하고
-    2) GPT 기반 플래너(_plan_routes_with_llm)로
-       - 어떤 에이전트들을
-       - 어떤 순서로
-       호출할지 결정한 다음
-    3) 해당 에이전트들을 순서대로 실행한다.
-
-    각 에이전트는 state["messages"] 에 assistant 메시지를 append 한다.
-    최종적으로는 마지막 에이전트의 답변이 "최종 답변"이 된다.
+    1) route_supervisor 로 1차 route 후보(primary) 정하기
+    2) _plan_routes_with_llm 로 에이전트 실행 순서 결정
+    3) 결정된 에이전트들을 순차 실행하여 context_list 에 정보 수집
+    4) Final Generator를 통해 취합하여 최종 답변 생성 
+       (단, chit_agent만 단독 실행된 경우 불필요한 LLM 호출을 줄이기 위해 바로 답변 반환)
     """
     user_message = _get_last_user_message(state)
     if not user_message:
@@ -284,7 +312,30 @@ def run_orchestrator(state: ChatState) -> ChatState:
     print(f"[SUPERVISOR] primary={primary_route}, planned_routes={planned_routes}")
 
     current_state = state
+    # 정보 수집용 배열 초기화
+    current_state["context_list"] = []
+
     for route in planned_routes:
         current_state = _run_agent(route, current_state)
+
+    # 예외: chit_agent가 단독 호출된 경우 (잡담/일반대화)
+    if len(planned_routes) == 1 and planned_routes[0] == "chit":
+        # Final Generator 호출 없이 chit_agent의 응답을 그대로 사용
+        context_list = current_state.get("context_list", [])
+        if context_list:
+            last_chit_context = context_list[-1]["context"]
+            current_state["answer"] = last_chit_context
+            current_state["sources"] = []
+            current_state["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": last_chit_context,
+                    "meta": {"agent": "chit_agent"},
+                }
+            )
+        return current_state
+
+    # 그 외 정보 수집을 수행한 경우: Final Generator 실행
+    current_state = _generate_final_answer(current_state)
 
     return current_state
